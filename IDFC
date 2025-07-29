@@ -1,0 +1,182 @@
+!pip install xgboost
+
+
+import CNNFeature
+from preprocessing import labels
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
+from sklearn.ensemble import (
+    RandomForestClassifier,
+    AdaBoostClassifier,
+    ExtraTreesClassifier as MondrianForestClassifier,
+    VotingClassifier
+)
+from xgboost import XGBClassifier
+
+# 1) 데이터 분할
+X_tr, X_val, y_tr, y_val = train_test_split(
+    CNNFeature.idfc_inputs,
+    labels[: CNNFeature.idfc_inputs.shape[0]],
+    test_size=0.2,
+    stratify=labels[: CNNFeature.idfc_inputs.shape[0]],
+    random_state=42
+)
+
+# 2) 논문 Table 1 최적 하이퍼파라미터 하드코딩
+best_params = {
+    'crf': {
+        'n_estimators': 107,
+        'min_samples_split': 7,
+        'min_samples_leaf': 13,
+        'max_features': 'sqrt',
+        'random_state': 42
+    },
+    'adaboost': {
+        'n_estimators': 90,
+        'learning_rate': 0.417,
+        'random_state': 42
+    },
+    'xgb': {
+        'learning_rate': 1.0,
+        'max_depth': 11,
+        'use_label_encoder': False,
+        'eval_metric': 'logloss',
+        'verbosity': 0,
+        'random_state': 42
+    },
+    'mf': {
+        'n_estimators': 2,
+        'random_state': 42
+    }
+}
+
+# 3) 개별 모델 생성
+crf  = RandomForestClassifier(**best_params['crf'])
+ada  = AdaBoostClassifier(**best_params['adaboost'])
+xgb  = XGBClassifier(**best_params['xgb'])
+mf   = MondrianForestClassifier(**best_params['mf'])
+
+# 4) IDFC 앙상블 구성 (soft voting)
+idfc = VotingClassifier(
+    estimators=[
+        ('CRF', crf),
+        ('AdaBoost', ada),
+        ('XGBoost', xgb),
+        ('MondrianForest', mf)
+    ],
+    voting='soft'
+)
+
+# 5) 학습
+idfc.fit(X_tr, y_tr)
+
+# 6) 검증 및 평가
+y_pred = idfc.predict(X_val)
+
+print("▶ Accuracy:", accuracy_score(y_val, y_pred))
+print("\n▶ Classification Report:\n", classification_report(y_val, y_pred))
+print("\n▶ Confusion Matrix:\n", confusion_matrix(y_val, y_pred))
+
+
+import itertools, tempfile, os, joblib
+from math import log
+from sklearn.metrics import accuracy_score
+
+# ASCI 가중치 (정확도 위주)
+W1, W2 = 0.9, 0.1
+
+results = []
+# selected_blocks: 1차 Grad‑CAM → Logistic 평가로 뽑은 블록 리스트
+# block_channel_feats: { block_name: (GradCAM 객체, top_idxs) }
+
+for combo in itertools.combinations(selected_blocks, 3):
+    # A) combo 블록들의 피처 뽑기
+    parts = []
+    for block in combo:
+        cam, idxs = block_channel_feats[block]
+        feats = []
+        for img in images:
+            x = transform(img).unsqueeze(0).to(device)
+            _ = cam.model(x)
+            acts = cam.activations[0]
+            sel  = acts[idxs]
+            feats.append(sel.reshape(-1).cpu().numpy())
+        parts.append(np.stack(feats))
+    cnn_feats = np.hstack(parts)                         # (N, D_cnn)
+    X        = np.hstack([cnn_feats, sensors[:cnn_feats.shape[0]]])
+    y        = labels[: X.shape[0]]
+
+    # B) train/val 분할
+    Xtr, Xte, ytr, yte = train_test_split(
+        X, y, test_size=0.2, stratify=y, random_state=42
+    )
+
+    # C) IDFC 학습 (tuned hyperparams 사용)
+    cascade = []
+    X_in    = Xtr.copy()
+    for layer in range(4):  # 논문에서 4층이 best
+        probs = []
+        # 각 base learner 생성 & 학습
+        for name, params in best_params.items():
+            if name == 'crf':
+                m = RandomForestClassifier(
+                    **params, max_features='sqrt', random_state=42
+                )
+            elif name == 'adaboost':
+                m = AdaBoostClassifier(**params, random_state=42)
+            elif name == 'xgb':
+                m = XGBClassifier(
+                    **params,
+                    use_label_encoder=False,
+                    eval_metric='logloss',
+                    verbosity=0,
+                    random_state=42
+                )
+            else:
+                m = MondrianForestClassifier(**params, random_state=42)
+
+            m.fit(X_in, ytr)
+            p = m.predict_proba(X_in)[:,1].reshape(-1,1)
+            probs.append(p)
+            cascade.append((name, m))
+
+        # 다음 레이어 입력 준비
+        layer_out = np.hstack(probs)
+        X_in      = np.hstack([X_in, layer_out])
+
+    # D) 검증 정확도 & 모델 크기 측정
+    # 예측
+    X_cv = Xte.copy()
+    for _, m in cascade[-4:]:  # 마지막 4개 학습기
+        p = m.predict_proba(X_cv)[:,1].reshape(-1,1)
+        X_cv = np.hstack([X_cv, p])
+    y_pred = (X_cv[:,-4:].mean(axis=1) > 0.5).astype(int)
+    acc    = accuracy_score(yte, y_pred)
+
+    # 크기 측정
+    tmp = tempfile.NamedTemporaryFile(suffix=".pkl", delete=False)
+    joblib.dump(cascade, tmp.name)
+    size_mb = os.path.getsize(tmp.name) / (1024*1024)
+    tmp.close(); os.remove(tmp.name)
+
+    results.append({
+        'combo': combo,
+        'accuracy': acc,
+        'size_mb': size_mb,
+        'cascade': cascade
+    })
+
+# E) ASCI 계산
+logs    = [log(r['size_mb']) for r in results]
+min_l, max_l = min(logs), max(logs)
+for r in results:
+    norm = (log(r['size_mb']) - min_l) / (max_l - min_l)
+    r['J'] = W1 * r['accuracy'] + W2 * (1 - norm)
+
+# F) 최적 모델 선택 & 저장
+best = max(results, key=lambda x: x['J'])
+print("▶ Best combo:", best['combo'],
+      f"Acc={best['accuracy']:.4f}, Size={best['size_mb']:.1f}MB, J={best['J']:.4f}")
+
+joblib.dump(best['cascade'], "idfc_optimized.pkl")
+print("✅ 최적화된 IDFC 모델을 idfc_optimized.pkl으로 저장했습니다.")
