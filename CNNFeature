@@ -1,0 +1,162 @@
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
+import torchvision.transforms as T
+from torchvision.models import (
+    alexnet, AlexNet_Weights,
+    resnet50, ResNet50_Weights,
+    vgg16, VGG16_Weights,
+    mobilenet_v2, MobileNet_V2_Weights,
+    efficientnet_b3, EfficientNet_B3_Weights
+)
+from preprocessing import preprocess_all
+
+# ===== 주요 파라미터 =====
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+TOP_K_CHANNELS = 50
+SAVE_DIR = "./channel_plots"  # 중요도 플롯 저장 디렉토리
+os.makedirs(SAVE_DIR, exist_ok=True)
+
+# 이미지 전처리(transform)
+transform = T.Compose([
+    T.ToTensor(),
+    T.Normalize([0.485,0.456,0.406], [0.229,0.224,0.225])
+])
+
+# ===== 6개 최종 레이어 스펙 정의 =====
+# 논문에서 1차 선별된 6개 레이어 정보만 사용
+SELECT_SPECS = {
+    "alexnet_features.6":    (alexnet,    AlexNet_Weights.DEFAULT,     "features.6"),
+    "resnet50_layer3":       (resnet50,   ResNet50_Weights.DEFAULT,    "layer3"),
+    "vgg16_features.10":     (vgg16,      VGG16_Weights.DEFAULT,       "features.10"),
+    "mobilenetv2_features.12": (mobilenet_v2, MobileNet_V2_Weights.DEFAULT, "features.12"),
+    "efficientnetb3_features.5": (efficientnet_b3, EfficientNet_B3_Weights.DEFAULT, "features.5"),
+    "efficientnetb3_features.7": (efficientnet_b3, EfficientNet_B3_Weights.DEFAULT, "features.7"),
+}
+
+# ===== GradCAM 클래스 정의 =====
+class GradCAM:
+    def __init__(self, model: nn.Module, target_layer: str):
+        # 모든 ReLU를 non-inplace로 설정해 backward hook 충돌 방지
+        for m in model.modules():
+            if isinstance(m, nn.ReLU):
+                m.inplace = False
+
+        self.model = model.eval().to(DEVICE)
+        self.target_layer = target_layer
+        self.activations = None
+        self.gradients = None
+
+        # forward/backward hook 등록
+        for name, module in self.model.named_modules():
+            if name == target_layer:
+                module.register_forward_hook(self._save_activation)
+                module.register_full_backward_hook(self._save_gradient)
+                break
+        else:
+            raise ValueError(f"Layer '{target_layer}' not found in model")
+
+    def _save_activation(self, module, inp, out):
+        self.activations = out
+
+    def _save_gradient(self, module, grad_in, grad_out):
+        # view 문제 방지를 위해 clone
+        self.gradients = grad_out[0].detach().clone()
+
+    def __call__(self, x: torch.Tensor, class_idx: int):
+        # 1) 순전파
+        logits = self.model(x)
+        # 2) gradient 초기화
+        self.model.zero_grad()
+        # 3) 관심 클래스 점수에 대해 backward
+        loss = logits[0, class_idx]
+        loss.backward(retain_graph=True)
+
+        g = self.gradients
+        # 4) 채널 중요도 계산
+        if g.ndim == 4:
+            # conv 레이어: H,W 차원 평균
+            weights = g.abs().mean(dim=(2,3))[0]
+        elif g.ndim == 2:
+            # FC 레이어: 이미 [1,C]
+            weights = g.abs()[0]
+        else:
+            raise RuntimeError(f"Unexpected grad shape {g.shape}")
+
+        return weights.cpu().numpy()
+
+# ===== 추출기 생성 함수: 6개 레이어만 =====
+def get_selected_extractors():
+    extractors = {}
+    for name, (ctor, w, layer) in SELECT_SPECS.items():
+        model = ctor(weights=w).to(DEVICE)
+        extractors[name] = GradCAM(model, layer)
+    return extractors
+
+# ===== 메인 파이프라인 =====
+# 1) 데이터 로드/전처리
+images, sensors, labels = preprocess_all()
+N = images.shape[0]
+
+# 2) Grad-CAM 중요도 계산 및 플롯 저장 (6개 레이어)
+extractors = get_selected_extractors()
+block_scores = {}
+for block_name, cam in extractors.items():
+    all_weights = []
+    for img_np, lbl in zip(images, labels):
+        x = transform(img_np).unsqueeze(0).to(DEVICE)
+        weights = cam(x, class_idx=int(lbl))  # 채널별 중요도
+        all_weights.append(weights)
+    all_weights = np.stack(all_weights, axis=0)  # (N, C)
+    mean_w = all_weights.mean(axis=0)            # (C,)
+    block_scores[block_name] = mean_w
+
+    # 시각화 플롯 저장
+    plt.figure(figsize=(6,3))
+    plt.plot(mean_w)
+    plt.title(f"{block_name} channel importance")
+    plt.xlabel("Channel index")
+    plt.ylabel("Mean |gradient|")
+    plt.tight_layout()
+    plt.savefig(os.path.join(SAVE_DIR, f"{block_name}.png"))
+    plt.close()
+
+# 3) 상위 K 채널 인덱스 선택
+block_topk = {
+    name: np.argsort(scores)[::-1].copy()[:TOP_K_CHANNELS]
+    for name, scores in block_scores.items()
+}
+
+# 4) 선택된 6개 레이어의 activation map을 flatten하여 피처 추출
+feat_list = []
+for img_np in images:
+    x = transform(img_np).unsqueeze(0).to(DEVICE)
+    parts = []
+
+    for blk_name, cam in extractors.items():
+        _ = cam.model(x)
+        act = cam.activations[0]       # (C, H, W)
+
+        top_idxs = block_topk[blk_name]
+        if not torch.is_tensor(top_idxs):
+            top_idxs = torch.tensor(top_idxs, dtype=torch.long, device=act.device)
+
+        sel = torch.index_select(act, dim=0, index=top_idxs)  # (K, H, W)
+
+        # ① GPU→CPU, detach, numpy로 안전 변환, 복사, flatten
+        sel_np = sel.detach().cpu().numpy().copy().reshape(-1)
+
+        # ② 오직 numpy 배열만 append
+        parts.append(sel_np)
+
+    # 이미지 하나당 parts 리스트(NumPy 1D 배열)의 concat 결과를 feat_list에 추가
+    feat_list.append(np.concatenate(parts))
+
+# for 루프 끝난 뒤에야 stack
+cnn_feats = np.stack(feat_list, axis=0)  # (N, D_selected)
+
+# 5) 센서 데이터와 concat → 최종 IDFC 입력
+idfc_inputs = np.hstack([cnn_feats, sensors[:cnn_feats.shape[0]]])
+print("▶ IDFC 입력 shape:", idfc_inputs.shape)
