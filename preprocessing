@@ -8,8 +8,8 @@ from tqdm import tqdm
 
 # 초기 설정
 IMAGE_SIZE = (224, 224)
-IMAGE_DIR   = r"C:\Users\Administrator\gasdata\Thermal Camera Images\Sample Thermal Camera Images"
-SENSOR_CSV  = r"C:\Users\Administrator\gasdata\Gas Sensors Measurements\Gas_Sensors_Measurements.csv"
+IMAGE_DIR   = r"image data path"
+SENSOR_CSV  = r"seosor data path"
 
 
 def preprocess_image(img_path):
