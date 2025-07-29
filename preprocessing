@@ -1,0 +1,81 @@
+import cv2
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import MinMaxScaler, LabelEncoder
+import os
+from glob import glob
+from tqdm import tqdm
+
+# 초기 설정
+IMAGE_SIZE = (224, 224)
+IMAGE_DIR   = r"C:\Users\Administrator\gasdata\Thermal Camera Images\Sample Thermal Camera Images"
+SENSOR_CSV  = r"C:\Users\Administrator\gasdata\Gas Sensors Measurements\Gas_Sensors_Measurements.csv"
+
+
+def preprocess_image(img_path):
+    img = cv2.imread(img_path)
+    if img is None:
+        raise ValueError(f"이미지 로드 실패: {img_path}")
+    img = cv2.resize(img, IMAGE_SIZE)
+    return img.astype(np.float32) / 255.0
+
+
+def load_thermal_images(image_dir):
+    """
+    이미지 배열과, 파일명(확장자 제거) 리스트를 반환합니다.
+    """
+    image_paths = sorted(glob(os.path.join(image_dir, "*", "*.png")))
+    images, names = [], []
+    for p in tqdm(image_paths, desc="Loading Images"):
+        images.append(preprocess_image(p))
+        # 파일명만: e.g. "0_NoGas" → CSV의 'Corresponding Image Name' 과 일치해야 함
+        names.append(os.path.splitext(os.path.basename(p))[0])
+    return np.array(images), names
+
+
+def preprocess_sensor_data(csv_path):
+    """
+    센서 DataFrame 과, 센서 측정 컬럼 리스트를 반환합니다.
+    """
+    df = pd.read_csv(csv_path)
+    # 연속형 센서 컬럼만
+    sensor_cols = df.select_dtypes(include="number").columns.tolist()
+    # MinMax 정규화
+    df[sensor_cols] = MinMaxScaler().fit_transform(df[sensor_cols])
+    # 가스 라벨 인코딩
+    df['gas_label_enc'] = LabelEncoder().fit_transform(df['Gas'])
+    # 인덱스를 'Corresponding Image Name' 으로 설정
+    df = df.set_index('Corresponding Image Name')
+    return df, sensor_cols
+
+
+def preprocess_all(image_dir=IMAGE_DIR, csv_path=SENSOR_CSV):
+    # 1) 이미지 + 파일명 로드
+    images, img_names = load_thermal_images(image_dir)
+
+    # 2) 센서 DataFrame + 센서 컬럼
+    df, sensor_cols = preprocess_sensor_data(csv_path)
+
+    # 3) 이미지 순서대로 센서값/라벨 매핑
+    sensors, labels = [], []
+    for name in img_names:
+        if name not in df.index:
+            # CSV에 없는 이미지면 건너뛰기
+            continue
+        row = df.loc[name]
+        sensors.append(row[sensor_cols].values)
+        labels.append(row['gas_label_enc'])
+
+    # 4) 넘파이 배열로 변환
+    images = images[:len(sensors)]  # 혹시 매핑 건너뛴 경우 대비
+    return (
+        images,
+        np.vstack(sensors),          # shape (N, num_sensor_cols)
+        np.array(labels, dtype=int)  # shape (N,)
+    )
+
+# 사용 예
+images, sensors, labels = preprocess_all()
+print("▶ images:",  images.shape)
+print("▶ sensors:", sensors.shape)
+print("▶ labels unique classes:", np.unique(labels))
